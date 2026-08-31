@@ -24,7 +24,7 @@ jobs:
     outputs:
       upload_url: ${{ steps.create.outputs.upload_url }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
       - name: Create GitHub release
@@ -65,7 +65,7 @@ jobs:
             archive: zip
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ env.RELEASE_TAG }}
 
