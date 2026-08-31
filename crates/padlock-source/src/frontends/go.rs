@@ -5,8 +5,21 @@
 
 use padlock_core::arch::ArchConfig;
 use padlock_core::ir::{AccessPattern, Field, StructLayout, TypeInfo};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use tree_sitter::{Node, Parser};
+
+// One parser per rayon thread — avoids re-allocating and re-validating the
+// grammar on every file.  Parser::parse with old_tree=None always does a full
+// fresh parse, so no reset is needed between files.
+thread_local! {
+    static PARSER: RefCell<Parser> = RefCell::new({
+        let mut p = Parser::new();
+        p.set_language(&tree_sitter_go::LANGUAGE.into())
+            .expect("Go grammar is always valid");
+        p
+    });
+}
 
 // ── type resolution ───────────────────────────────────────────────────────────
 
@@ -40,8 +53,68 @@ fn go_type_size_align(ty: &str, arch: &'static ArchConfig) -> (usize, usize) {
         // by `parse_struct_type` so the output layer can warn the user.
         "error" | "any" => (arch.pointer_size * 2, arch.pointer_size),
         ty if ty.starts_with("interface") => (arch.pointer_size * 2, arch.pointer_size),
+        // ── Well-known stdlib concrete types ─────────────────────────────────
+        // These are qualified names that would otherwise fall to pointer-size +
+        // uncertain_fields.  Sizes are verified against Go 1.19+ on amd64/arm64
+        // and are stable across Go versions (Go 1 compatibility guarantee covers
+        // struct size).  `is_known_external_go_type` must stay in sync with this
+        // list so these types are not also added to uncertain_fields.
+        //
+        // sync.Mutex: { state int32; sema uint32 } = 8B
+        "sync.Mutex" => (8, 4),
+        // sync.RWMutex: { w Mutex; writerSem, readerSem uint32; readerCount,
+        //   readerWait int32/atomic.Int32 } = 24B (stable since Go 1.1)
+        "sync.RWMutex" => (24, 8),
+        // sync.Once: { done uint32; m Mutex } = 12B
+        "sync.Once" => (12, 4),
+        // atomic.Bool / atomic.Int32 / atomic.Uint32: { _ noCopy; v uint32 } = 4B
+        "atomic.Bool" | "atomic.Int32" | "atomic.Uint32" => (4, 4),
+        // atomic.Int64 / atomic.Uint64: { _ noCopy; _ align64; v int64 } = 8B, align 8
+        "atomic.Int64" | "atomic.Uint64" => (8, 8),
+        // atomic.Uintptr: { _ noCopy; _ align64; v uintptr } = arch word size, align word
+        "atomic.Uintptr" => (arch.pointer_size, arch.pointer_size),
+        // atomic.Value: { v any } — `any` is two words (type ptr + data ptr)
+        "atomic.Value" => (arch.pointer_size * 2, arch.pointer_size),
+        // sync.WaitGroup: { noCopy (0B); state atomic.Uint64 (8B, align 8);
+        //   sema uint32 (4B) } = 12B, align 8. Stable since Go 1.
+        "sync.WaitGroup" => (12, 8),
+        // sync.Map (Go 1.19+): { mu Mutex(8); read atomic.Pointer(8);
+        //   dirty map(8); misses int(8) } = 4 words. Stable layout since 1.19.
+        "sync.Map" => (arch.pointer_size * 4, arch.pointer_size),
+        // time.Time: { wall uint64; ext int64; loc *Location } = 24B, align 8.
+        // Stable across all Go versions (Go 1 compatibility guarantee).
+        "time.Time" => (24, 8),
+        // strings.Builder: { addr *Builder(1 word); buf []byte(3 words) } = 4 words.
+        "strings.Builder" => (arch.pointer_size * 4, arch.pointer_size),
+        // bytes.Buffer: { buf []byte(3 words); off int(1 word); lastRead int8(1B+pad) }
+        //   = 5 words on 64-bit (40B), 5 words on 32-bit (20B).
+        "bytes.Buffer" => (arch.pointer_size * 5, arch.pointer_size),
         _ => (arch.pointer_size, arch.pointer_size),
     }
+}
+
+/// Returns `true` for qualified external-package type names whose sizes are
+/// known and hardcoded in `go_type_size_align`.  These must NOT be added to
+/// `uncertain_fields` because their sizes are accurate, not approximated.
+fn is_known_external_go_type(ty: &str) -> bool {
+    matches!(
+        ty,
+        "sync.Mutex"
+            | "sync.RWMutex"
+            | "sync.Once"
+            | "sync.WaitGroup"
+            | "atomic.Bool"
+            | "atomic.Int32"
+            | "atomic.Uint32"
+            | "atomic.Int64"
+            | "atomic.Uint64"
+            | "atomic.Uintptr"
+            | "atomic.Value"
+            | "time.Time"
+            | "sync.Map"
+            | "strings.Builder"
+            | "bytes.Buffer"
+    )
 }
 
 // ── phase-1: local interface name collection ──────────────────────────────────
@@ -122,7 +195,7 @@ fn parse_type_declaration(
     let decl_start_byte = node.start_byte();
     // type_declaration has a type_spec child
     for i in 0..node.child_count() {
-        let child = node.child(i)?;
+        let Some(child) = node.child(i) else { continue };
         if child.kind() == "type_spec" {
             return parse_type_spec(
                 source,
@@ -150,7 +223,7 @@ fn parse_type_spec(
     let mut is_generic = false;
 
     for i in 0..node.child_count() {
-        let child = node.child(i)?;
+        let Some(child) = node.child(i) else { continue };
         match child.kind() {
             "type_identifier" => name = Some(source[child.byte_range()].to_string()),
             "struct_type" => struct_node = Some(child),
@@ -162,10 +235,6 @@ fn parse_type_spec(
     let name = name?;
 
     if is_generic {
-        eprintln!(
-            "padlock: note: skipping '{name}' — generic struct \
-             (layout depends on type arguments; use binary analysis for accurate results)"
-        );
         crate::record_skipped(
             &name,
             "generic struct — layout depends on type arguments; \
@@ -198,10 +267,12 @@ fn parse_struct_type(
     let mut raw_fields: Vec<(String, String, Option<String>, u32)> = Vec::new();
 
     for i in 0..node.child_count() {
-        let child = node.child(i)?;
+        let Some(child) = node.child(i) else { continue };
         if child.kind() == "field_declaration_list" {
             for j in 0..child.child_count() {
-                let field_node = child.child(j)?;
+                let Some(field_node) = child.child(j) else {
+                    continue;
+                };
                 if field_node.kind() == "field_declaration" {
                     collect_field_declarations(source, field_node, &mut raw_fields);
                 }
@@ -233,9 +304,11 @@ fn parse_struct_type(
         // packages. Without type information we cannot determine whether they are
         // interfaces (16B fat pointer) or structs (arbitrary size). Flag them as
         // uncertain so the output layer can warn the user.
+        // Exception: types in `is_known_external_go_type` have hardcoded accurate
+        // sizes in `go_type_size_align` and must not be marked uncertain.
         let is_pointer = ty_name.starts_with('*');
         let base_ty = ty_name.trim_start_matches('*');
-        if !is_pointer && base_ty.contains('.') {
+        if !is_pointer && base_ty.contains('.') && !is_known_external_go_type(base_ty) {
             uncertain_fields.push(fname.clone());
         }
 
@@ -379,11 +452,16 @@ fn collect_field_declarations(
             }
         }
     } else if let Some(ty) = ty_text {
-        // Embedded (anonymous) field: `sync.Mutex` or `Base`.
-        // Go field name is the unqualified type name.
-        // The nested-struct resolution pass in lib.rs will later fill in
-        // the correct size/align from other parsed struct layouts.
-        let simple_name = ty.split('.').next_back().unwrap_or(&ty).to_string();
+        // Embedded (anonymous) field: `sync.Mutex`, `Base`, or `*Base`.
+        // Go field name is the unqualified type name WITHOUT the pointer `*`
+        // (Go spec: for `*T`, the implicit field name is `T`, not `*T`).
+        // The type string retains `*` so go_type_size_align returns pointer size.
+        let simple_name = ty
+            .trim_start_matches('*')
+            .split('.')
+            .next_back()
+            .unwrap_or(&ty)
+            .to_string();
         out.push((simple_name, ty, guard, field_line));
     }
 }
@@ -391,11 +469,9 @@ fn collect_field_declarations(
 // ── public API ────────────────────────────────────────────────────────────────
 
 pub fn parse_go(source: &str, arch: &'static ArchConfig) -> anyhow::Result<Vec<StructLayout>> {
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_go::LANGUAGE.into())?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| anyhow::anyhow!("tree-sitter-go parse failed"))?;
+    let tree = PARSER
+        .with(|p| p.borrow_mut().parse(source, None))
+        .ok_or_else(|| anyhow::anyhow!("tree-sitter-go failed to parse source"))?;
     Ok(extract_structs(source, tree.root_node(), arch))
 }
 
@@ -786,6 +862,53 @@ type Outer struct {
     // ── bad weather: embedded fields ──────────────────────────────────────────
 
     #[test]
+    fn embedded_ptr_field_name_is_type_without_star() {
+        // Go spec: for `*T`, the implicit field name is `T`, not `*T`.
+        let src = "package p\ntype A struct { *B }\ntype B struct { X uint8 }";
+        let layouts = parse_go(src, &X86_64_SYSV).unwrap();
+        let a = layouts.iter().find(|l| l.name == "A").expect("A");
+        assert_eq!(
+            a.fields[0].name, "B",
+            "embedded pointer field name must be 'B' not '*B'"
+        );
+        // Size must be pointer-size (8), NOT B's struct size (1).
+        assert_eq!(
+            a.fields[0].size, 8,
+            "embedded pointer is always pointer-sized"
+        );
+    }
+
+    #[test]
+    fn embedded_ptr_struct_does_not_hang() {
+        // Regression: tree-sitter-go <=0.23 had a quadratic parse bug on structs
+        // containing embedded pointer fields paired with non-builtin field types.
+        let src = "package p\ntype A struct { *B }\ntype B struct { X uint8 }";
+        let layouts = parse_go(src, &X86_64_SYSV).unwrap();
+        assert!(layouts.iter().any(|l| l.name == "B"));
+    }
+
+    #[test]
+    fn embedded_ptr_mutual_recursion_does_not_hang() {
+        // Regression: parse-error trees from tree-sitter-go can strip the `*` from
+        // embedded pointer types, making Rec1/Rec2 appear to embed each other
+        // non-transitively. resolve_nested_structs must not loop forever.
+        use crate::{SourceLanguage, parse_source_str};
+        let src = "package p\ntype Rec1 struct { *Rec2 }\ntype Rec2 struct { F string; *Rec1 }";
+        let _ = parse_source_str(src, &SourceLanguage::Go, &X86_64_SYSV).unwrap();
+    }
+
+    #[test]
+    fn embedded_ptr_combined_patterns_does_not_hang() {
+        use crate::{SourceLanguage, parse_source_str};
+        let src = "package main\n\n\
+                   type Rec1 struct { *Rec2 }\n\
+                   type Rec2 struct { F string; *Rec1 }\n\n\
+                   type A struct { *B }\n\
+                   type B struct { X uint8 }\n";
+        let _ = parse_source_str(src, &SourceLanguage::Go, &X86_64_SYSV).unwrap();
+    }
+
+    #[test]
     fn embedded_unknown_type_falls_back_to_pointer_size() {
         // If the embedded type is not defined in the file, size = pointer_size
         let src = "package p\ntype S struct { external.Type\nX int32 }";
@@ -798,5 +921,126 @@ type Outer struct {
             .expect("Type field");
         // Falls back to pointer size (8 on x86_64) since type is unknown
         assert_eq!(emb.size, 8);
+    }
+
+    // ── well-known external Go stdlib types ───────────────────────────────────
+
+    #[test]
+    fn sync_mutex_sized_correctly() {
+        let src = "package p\nimport \"sync\"\ntype S struct { mu sync.Mutex; x int32 }";
+        let layouts = parse_go(src, &X86_64_SYSV).unwrap();
+        let l = layouts.iter().find(|l| l.name == "S").expect("S");
+        let mu = l.fields.iter().find(|f| f.name == "mu").expect("mu");
+        assert_eq!(mu.size, 8, "sync.Mutex must be 8B");
+        assert_eq!(mu.align, 4);
+        // mu is not uncertain — its size is known
+        assert!(
+            !l.uncertain_fields.contains(&"mu".to_string()),
+            "sync.Mutex must not be in uncertain_fields"
+        );
+    }
+
+    #[test]
+    fn sync_rwmutex_sized_correctly() {
+        let src = "package p\nimport \"sync\"\ntype S struct { rw sync.RWMutex }";
+        let layouts = parse_go(src, &X86_64_SYSV).unwrap();
+        let l = layouts.iter().find(|l| l.name == "S").expect("S");
+        let rw = l.fields.iter().find(|f| f.name == "rw").expect("rw");
+        assert_eq!(rw.size, 24, "sync.RWMutex must be 24B");
+        assert!(!l.uncertain_fields.contains(&"rw".to_string()));
+    }
+
+    #[test]
+    fn sync_once_sized_correctly() {
+        let src = "package p\nimport \"sync\"\ntype S struct { o sync.Once }";
+        let layouts = parse_go(src, &X86_64_SYSV).unwrap();
+        let l = layouts.iter().find(|l| l.name == "S").expect("S");
+        let o = l.fields.iter().find(|f| f.name == "o").expect("o");
+        assert_eq!(o.size, 12, "sync.Once must be 12B");
+        assert!(!l.uncertain_fields.contains(&"o".to_string()));
+    }
+
+    #[test]
+    fn atomic_value_sized_correctly() {
+        let src = "package p\nimport \"sync/atomic\"\ntype S struct { v atomic.Value }";
+        let layouts = parse_go(src, &X86_64_SYSV).unwrap();
+        let l = layouts.iter().find(|l| l.name == "S").expect("S");
+        let v = l.fields.iter().find(|f| f.name == "v").expect("v");
+        assert_eq!(v.size, 16, "atomic.Value must be 16B (any = 2 words)");
+        assert!(!l.uncertain_fields.contains(&"v".to_string()));
+    }
+
+    #[test]
+    fn atomic_int64_sized_correctly() {
+        let src = "package p\nimport \"sync/atomic\"\ntype S struct { n atomic.Int64 }";
+        let layouts = parse_go(src, &X86_64_SYSV).unwrap();
+        let l = layouts.iter().find(|l| l.name == "S").expect("S");
+        let n = l.fields.iter().find(|f| f.name == "n").expect("n");
+        assert_eq!(n.size, 8, "atomic.Int64 must be 8B");
+        assert_eq!(n.align, 8);
+        assert!(!l.uncertain_fields.contains(&"n".to_string()));
+    }
+
+    #[test]
+    fn atomic_int32_sized_correctly() {
+        let src = "package p\nimport \"sync/atomic\"\ntype S struct { n atomic.Int32 }";
+        let layouts = parse_go(src, &X86_64_SYSV).unwrap();
+        let l = layouts.iter().find(|l| l.name == "S").expect("S");
+        let n = l.fields.iter().find(|f| f.name == "n").expect("n");
+        assert_eq!(n.size, 4, "atomic.Int32 must be 4B");
+        assert!(!l.uncertain_fields.contains(&"n".to_string()));
+    }
+
+    #[test]
+    fn atomic_bool_sized_correctly() {
+        let src = "package p\nimport \"sync/atomic\"\ntype S struct { b atomic.Bool }";
+        let layouts = parse_go(src, &X86_64_SYSV).unwrap();
+        let l = layouts.iter().find(|l| l.name == "S").expect("S");
+        let b = l.fields.iter().find(|f| f.name == "b").expect("b");
+        assert_eq!(b.size, 4, "atomic.Bool must be 4B");
+        assert!(!l.uncertain_fields.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn struct_with_mutex_and_data_has_correct_total_size() {
+        // Realistic server pattern: mu sync.Mutex (8B) + count int64 (8B) = 16B
+        let src = "package p\nimport \"sync\"\ntype Counter struct { mu sync.Mutex; count int64 }";
+        let layouts = parse_go(src, &X86_64_SYSV).unwrap();
+        let l = layouts
+            .iter()
+            .find(|l| l.name == "Counter")
+            .expect("Counter");
+        assert_eq!(l.total_size, 16, "Counter must be 16B");
+    }
+
+    #[test]
+    fn sync_waitgroup_sized_correctly() {
+        // sync.WaitGroup: { noCopy (0B); state atomic.Uint64 (8B); sema uint32 (4B) }
+        // = 12B, align 8. Common in concurrent Go code.
+        let src = "package p\nimport \"sync\"\ntype S struct { wg sync.WaitGroup; x int32 }";
+        let layouts = parse_go(src, &X86_64_SYSV).unwrap();
+        let l = layouts.iter().find(|l| l.name == "S").expect("S");
+        let wg = l.fields.iter().find(|f| f.name == "wg").expect("wg");
+        assert_eq!(wg.size, 12, "sync.WaitGroup must be 12B");
+        assert_eq!(wg.align, 8);
+        assert!(
+            !l.uncertain_fields.contains(&"wg".to_string()),
+            "sync.WaitGroup must not be in uncertain_fields"
+        );
+    }
+
+    #[test]
+    fn time_time_sized_correctly() {
+        // time.Time: { wall uint64; ext int64; loc *Location } = 24B, align 8.
+        let src = "package p\nimport \"time\"\ntype Event struct { ts time.Time; id int64 }";
+        let layouts = parse_go(src, &X86_64_SYSV).unwrap();
+        let l = layouts.iter().find(|l| l.name == "Event").expect("Event");
+        let ts = l.fields.iter().find(|f| f.name == "ts").expect("ts");
+        assert_eq!(ts.size, 24, "time.Time must be 24B");
+        assert_eq!(ts.align, 8);
+        assert!(
+            !l.uncertain_fields.contains(&"ts".to_string()),
+            "time.Time must not be in uncertain_fields"
+        );
     }
 }

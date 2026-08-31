@@ -6,7 +6,17 @@
 
 use padlock_core::arch::ArchConfig;
 use padlock_core::ir::{Field, StructLayout, TypeInfo};
+use std::cell::RefCell;
 use tree_sitter::{Node, Parser};
+
+thread_local! {
+    static PARSER: RefCell<Parser> = RefCell::new({
+        let mut p = Parser::new();
+        p.set_language(&tree_sitter_zig::LANGUAGE.into())
+            .expect("Zig grammar is always valid");
+        p
+    });
+}
 
 // ── type resolution ───────────────────────────────────────────────────────────
 
@@ -139,8 +149,60 @@ fn type_node_size_align(source: &str, node: Node<'_>, arch: &'static ArchConfig)
         }
         // error union E!T — approximate as two words
         "error_union" => (arch.pointer_size * 2, arch.pointer_size),
+        // @Vector(N, T): SIMD vector type.
+        // Size = N × sizeof(T); alignment = size (SIMD vectors are naturally
+        // aligned to their own size, capped at 64 bytes for current hardware).
+        "builtin_function" => {
+            if let Some((count, elem_sz, elem_al)) = parse_vector_builtin(source, node, arch) {
+                let size = count * elem_sz;
+                let align = size.next_power_of_two().min(64).max(elem_al);
+                return (size, align);
+            }
+            (arch.pointer_size, arch.pointer_size)
+        }
         _ => (arch.pointer_size, arch.pointer_size),
     }
+}
+
+/// For `@Vector(N, T)` nodes, return `Some((count, elem_size, elem_align))`.
+fn parse_vector_builtin(
+    source: &str,
+    node: Node<'_>,
+    arch: &'static ArchConfig,
+) -> Option<(usize, usize, usize)> {
+    // Verify the builtin name is @Vector
+    let name_node = (0..node.child_count())
+        .filter_map(|i| node.child(i))
+        .find(|c| c.kind() == "builtin_identifier")?;
+    if source[name_node.byte_range()].trim() != "@Vector" {
+        return None;
+    }
+    let args_node = (0..node.child_count())
+        .filter_map(|i| node.child(i))
+        .find(|c| c.kind() == "arguments")?;
+
+    let mut count: Option<usize> = None;
+    let mut elem: Option<(usize, usize)> = None;
+
+    for i in 0..args_node.child_count() {
+        let Some(child) = args_node.child(i) else {
+            continue;
+        };
+        match child.kind() {
+            "integer" | "integer_literal" => {
+                if count.is_none() {
+                    count = source[child.byte_range()].trim().parse().ok();
+                }
+            }
+            "builtin_type" | "identifier" if elem.is_none() => {
+                let text = source[child.byte_range()].trim();
+                elem = Some(zig_type_size_align(text, arch));
+            }
+            _ => {}
+        }
+    }
+    let (elem_sz, elem_al) = elem?;
+    Some((count?, elem_sz, elem_al))
 }
 
 /// For `[N]T` nodes, return `Some((count, elem_size, elem_align))`.
@@ -154,7 +216,7 @@ fn parse_array_type(
     let mut elem: Option<(usize, usize)> = None;
 
     for i in 0..node.child_count() {
-        let child = node.child(i)?;
+        let Some(child) = node.child(i) else { continue };
         match child.kind() {
             "integer" | "integer_literal" => {
                 let text = source[child.byte_range()].trim();
@@ -270,10 +332,6 @@ fn note_comptime_generic_fn(source: &str, node: Node<'_>) {
         });
 
     if returns_type {
-        eprintln!(
-            "padlock: note: skipping '{fn_name}' — comptime-generic function \
-             (returns a struct type; layout depends on type arguments)"
-        );
         crate::record_skipped(
             &fn_name,
             "comptime-generic function — returns a struct type; \
@@ -294,7 +352,7 @@ fn parse_variable_declaration(
     let mut union_node: Option<Node> = None;
 
     for i in 0..node.child_count() {
-        let child = node.child(i)?;
+        let Some(child) = node.child(i) else { continue };
         match child.kind() {
             "identifier" if name.is_none() => {
                 // The first identifier after `const`/`var` is the name
@@ -309,10 +367,9 @@ fn parse_variable_declaration(
     let name = name?;
     let mut layout = if let Some(sn) = struct_node {
         parse_struct_declaration(source, sn, name, arch, source_line)?
-    } else if let Some(un) = union_node {
-        parse_union_declaration(source, un, name, arch, source_line)?
     } else {
-        return None;
+        let un = union_node?;
+        parse_union_declaration(source, un, name, arch, source_line)?
     };
     layout.suppressed_findings =
         super::suppress::suppressed_from_preceding_source(source, decl_start_byte);
@@ -337,7 +394,7 @@ fn parse_union_declaration(
     let mut raw_fields: Vec<(String, String, usize, usize, u32)> = Vec::new();
 
     for i in 0..node.child_count() {
-        let child = node.child(i)?;
+        let Some(child) = node.child(i) else { continue };
         match child.kind() {
             // `union(enum)` — `enum` keyword is a direct child
             "enum" => is_tagged = true,
@@ -458,7 +515,7 @@ fn parse_struct_declaration(
     let mut uncertain_fields: Vec<String> = Vec::new();
 
     for i in 0..node.child_count() {
-        let child = node.child(i)?;
+        let Some(child) = node.child(i) else { continue };
         match child.kind() {
             "packed" => is_packed = true,
             "extern" => is_extern = true,
@@ -542,8 +599,6 @@ fn parse_struct_declaration(
         }
     }
 
-    let _ = is_extern; // affects ABI guarantees, not layout simulation
-
     Some(StructLayout {
         name,
         total_size: offset,
@@ -554,7 +609,13 @@ fn parse_struct_declaration(
         arch,
         is_packed,
         is_union: false,
-        is_repr_rust: false,
+        // Regular Zig structs have implementation-defined field order (the
+        // compiler may reorder for optimal packing). Only `extern struct` and
+        // `packed struct` guarantee a stable, C-compatible layout. Flagging
+        // regular structs mirrors what `is_repr_rust` does for plain Rust
+        // structs: findings are downgraded one severity level so they remain
+        // visible without over-alarming on padding the compiler already removes.
+        is_repr_rust: !is_extern && !is_packed,
         suppressed_findings: Vec::new(), // set by parse_variable_declaration
         uncertain_fields,
     })
@@ -572,13 +633,13 @@ fn parse_container_field(
     let mut size_align: Option<(usize, usize)> = None;
 
     for i in 0..node.child_count() {
-        let child = node.child(i)?;
+        let Some(child) = node.child(i) else { continue };
         match child.kind() {
             "identifier" if field_name.is_none() => {
                 field_name = Some(source[child.byte_range()].to_string());
             }
             "builtin_type" | "pointer_type" | "nullable_type" | "slice_type" | "array_type"
-            | "error_union" => {
+            | "error_union" | "builtin_function" => {
                 let text = source[child.byte_range()].to_string();
                 size_align = Some(type_node_size_align(source, child, arch));
                 type_text = Some(text);
@@ -610,10 +671,8 @@ fn parse_container_field(
 // ── public API ────────────────────────────────────────────────────────────────
 
 pub fn parse_zig(source: &str, arch: &'static ArchConfig) -> anyhow::Result<Vec<StructLayout>> {
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_zig::LANGUAGE.into())?;
-    let tree = parser
-        .parse(source, None)
+    let tree = PARSER
+        .with(|p| p.borrow_mut().parse(source, None))
         .ok_or_else(|| anyhow::anyhow!("tree-sitter-zig parse failed"))?;
     Ok(extract_structs(source, tree.root_node(), arch))
 }
@@ -901,5 +960,77 @@ mod tests {
             skipped.iter().any(|s| s.name == "ArrayList"),
             "comptime-generic function must be recorded as skipped; got: {skipped:?}"
         );
+    }
+
+    // ── is_repr_rust flag for layout stability ────────────────────────────────
+
+    #[test]
+    fn regular_zig_struct_is_repr_rust() {
+        // Regular Zig structs have implementation-defined field order — the
+        // compiler may reorder fields. Flagged with is_repr_rust so findings
+        // are downgraded one severity level.
+        let src = "const S = struct { a: u8, b: u64 };";
+        let layouts = parse_zig(src, &X86_64_SYSV).unwrap();
+        assert!(
+            layouts[0].is_repr_rust,
+            "regular Zig struct must set is_repr_rust (compiler may reorder)"
+        );
+    }
+
+    #[test]
+    fn extern_zig_struct_is_not_repr_rust() {
+        // extern struct guarantees C-compatible layout — no reordering allowed.
+        let src = "const E = extern struct { x: i32, y: f64 };";
+        let layouts = parse_zig(src, &X86_64_SYSV).unwrap();
+        assert!(
+            !layouts[0].is_repr_rust,
+            "extern struct has stable layout, must not set is_repr_rust"
+        );
+    }
+
+    #[test]
+    fn packed_zig_struct_is_not_repr_rust() {
+        // packed struct guarantees bit-exact layout — no reordering allowed.
+        let src = "const P = packed struct { a: u8, b: u8 };";
+        let layouts = parse_zig(src, &X86_64_SYSV).unwrap();
+        assert!(
+            !layouts[0].is_repr_rust,
+            "packed struct has stable layout, must not set is_repr_rust"
+        );
+    }
+
+    // ── @Vector sizing ────────────────────────────────────────────────────────
+
+    #[test]
+    fn zig_vector_f32x4_size() {
+        // @Vector(4, f32) → 4 × 4B = 16B, aligned to 16
+        let src = "const S = extern struct { v: @Vector(4, f32) };";
+        let layouts = parse_zig(src, &X86_64_SYSV).unwrap();
+        assert_eq!(layouts.len(), 1);
+        let f = &layouts[0].fields[0];
+        assert_eq!(f.size, 16);
+        assert_eq!(f.align, 16);
+    }
+
+    #[test]
+    fn zig_vector_i32x8_size() {
+        // @Vector(8, i32) → 8 × 4B = 32B, aligned to 32
+        let src = "const S = extern struct { v: @Vector(8, i32) };";
+        let layouts = parse_zig(src, &X86_64_SYSV).unwrap();
+        assert_eq!(layouts.len(), 1);
+        let f = &layouts[0].fields[0];
+        assert_eq!(f.size, 32);
+        assert_eq!(f.align, 32);
+    }
+
+    #[test]
+    fn zig_struct_with_vector_and_scalar() {
+        // Layout: @Vector(4, f32)(16B, align 16) + padding + u8 field
+        let src = "const S = extern struct { v: @Vector(4, f32), x: u8 };";
+        let layouts = parse_zig(src, &X86_64_SYSV).unwrap();
+        assert_eq!(layouts.len(), 1);
+        assert_eq!(layouts[0].fields[0].size, 16);
+        // u8 follows the vector at offset 16 (no padding needed after aligned vector)
+        assert_eq!(layouts[0].fields[1].offset, 16);
     }
 }

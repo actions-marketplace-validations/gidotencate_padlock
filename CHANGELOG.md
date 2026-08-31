@@ -2,6 +2,129 @@
 
 All notable changes to padlock are documented here.
 
+## [0.10.10] — 2026-08-01
+
+### Added
+- **i686/x86_32 architecture**: `x86`, `i386`, `i586`, `i686` short names and `i686-*` / `i386-*` / `i586-*` target triples now resolve to an `X86_32` arch config with 4-byte pointer, 64-byte cache line, and `max_align = 4` (Linux SysV ABI — `double` and `long long` are 4-byte aligned in structs).
+- **C++ `struct` keyword virtual dispatch pointer**: C++ structs with `virtual` methods now get the same hidden `__vptr` field injected at offset 0 as classes. Previously, vptr injection only applied to `class`-keyword types; structs with `virtual ~Foo()` or `virtual void bar()` were silently undersized by 8 bytes.
+- **MSVC `__declspec(align(N))` support**: `__declspec(align(N))` on a struct type or on individual fields is now parsed and applied as an alignment override, matching the existing support for GCC/Clang `__attribute__((aligned(N)))` and C++11 `alignas(N)`. Handles the case where `ms_declspec_modifier` appears as a sibling of the struct node in the AST (not a child).
+- **`std::variant<T1, T2, ...>` sizing**: parametric sizing via a new bracket-aware template argument splitter (`split_template_args`). Storage = `max(sizeof(T...))` padded to `max(alignof(T...))`, plus a 4B discriminant, total padded to effective alignment. Also handles deeply-nested args like `std::variant<std::map<int,int>, double>`.
+- **`std::pair<T1, T2>` sizing**: sequential struct layout of two fields with proper alignment.
+- **`std::tuple<T1, T2, ...>` sizing**: approximate sequential layout (same total size as struct-of-fields).
+- **`std::array<T, N>` sizing**: `N × sizeof(T)` with `alignof(T)` — now computed from template args instead of falling through to pointer-size.
+- **Zig `@Vector(N, T)` sizing**: SIMD vector types are now sized as `N × sizeof(T)` with SIMD-aligned alignment (`size.next_power_of_two().min(64)`). Tree-sitter `builtin_function` nodes are now recognized in both `parse_container_field` and `type_node_size_align`.
+- **`LocalityIssue` split suggestion**: all output formatters (human summary, SARIF, Markdown report, `explain`) now include a concrete split suggestion when a locality issue is detected. Example: `Split: struct FooHot { a, b } / struct FooCold { c, d }`.
+- **More `std::` type sizes**: `std::thread` (8 words), `std::jthread` (9 words), `std::complex<T>` (2 × sizeof(T)), `std::bitset<N>` (ceil(N/64) × 8 bytes), `std::chrono::duration<Rep, Period>` and `std::chrono::time_point<Clock, Duration>` (sized by Rep/Duration's underlying type), `std::initializer_list<T>` (2 words: pointer + size), `std::filesystem::path` (32B on 64-bit).
+- **Go `sync.Map`, `strings.Builder`, `bytes.Buffer` sizing**: all three previously fell to `uncertain_fields` as unrecognised qualified names. Added to the known-type table with correct 64-bit sizes (`sync.Map` = 32B, `strings.Builder` = 32B, `bytes.Buffer` = 40B).
+
+### Fixed
+- **C++ fix generator method preservation**: method declarations inside `class` or `struct` bodies (e.g. `void foo();`, `virtual ~Foo();`) were silently dropped when the reorder fix was applied. The C chunk extractor now tags each chunk as either `Field` (reorderable) or `Passthrough` (method or other non-field text). Passthrough chunks are emitted in their original relative positions around the reordered fields, so class bodies are structurally preserved after a fix.
+
+## [0.10.9] — 2026-08-01
+
+### Security
+- **`js-yaml`** — forced to `>=4.3.0` via npm override; YAML merge-key chains could cause quadratic CPU consumption (GHSA-mh99-v99m-4gvg equivalent, transitive via `@vscode/vsce` → `@secretlint`).
+- **`fast-uri`** — forced to `>=3.1.4` via npm override; host confusion via literal backslash authority delimiter and failed IDN canonicalization (transitive via `@vscode/vsce` → `ajv`).
+- **`brace-expansion`** — forced to `>=5.0.8` via npm override; DoS via unbounded expansion length (transitive via `@vscode/vsce` → `minimatch`).
+- **`linkify-it`** — bumped to `5.0.2` via dependabot PR #42; quadratic-complexity DoS via `mailto:` validator scan-loop (transitive via `@vscode/vsce` → `markdown-it`).
+
+## [0.10.8] — 2026-07-31
+
+### Fixed
+- **DWARF5 bitfields (`DW_AT_data_bit_offset`)**: modern GCC (12+) emits bitfield members using `DW_AT_data_bit_offset` (an absolute bit offset from the struct start, DWARF5) instead of the older `DW_AT_data_member_location` (byte offset, DWARF4). The extractor only handled the DWARF4 form, so DWARF5 bitfield members were silently skipped — their occupied bytes appeared as spurious padding gaps. Fixed by falling through to `DW_AT_data_bit_offset` when `DW_AT_data_member_location` is absent, handling `DW_FORM_data1`/`data2`/`data4`/`data8`/`udata`/`sdata` encodings, and deriving the storage-unit size from the bit span (tracking `max_bit_exclusive` per group) when `DW_AT_byte_size` is absent — also typical for DWARF5 groups. Also handles `DW_AT_bit_size` encoded as `DW_FORM_implicit_const` (decoded by gimli as `Sdata` rather than `Udata`). Eliminates false gap reports on structs like SQLite's `VdbeCursor`.
+- **`DW_TAG_class_type` for C++ classes**: C++ `class` declarations use `DW_TAG_class_type` instead of `DW_TAG_structure_type`. Previously the DWARF extractor (both `extract_from_unit` and `type_resolver`) only processed `DW_TAG_structure_type`, so binary analysis of C++ binaries silently omitted all classes declared with the `class` keyword. Added `DW_TAG_class_type` alongside `DW_TAG_structure_type` in both places.
+- **`DW_AT_alignment` on struct and field DIEs**: explicit `alignas(N)` / `__attribute__((aligned(N)))` on a struct type declaration produces `DW_AT_alignment` on the struct DIE; on a field declaration it produces `DW_AT_alignment` on the member DIE. Neither was read — alignment was always inferred from the maximum field type alignment, which can understate the actual alignment and affect false-sharing analysis. `extract_struct` now reads the struct-level `DW_AT_alignment`; `extract_field` now reads the member-level `DW_AT_alignment` and takes the maximum with the type alignment.
+- **Zig regular struct `is_repr_rust` flag**: regular Zig structs (not `extern` or `packed`) have implementation-defined field order — the compiler may reorder fields just like Rust's `repr(Rust)`. Previously `is_repr_rust` was hardcoded to `false` for all Zig struct variants, so padding/reorder findings were reported at full severity even on layouts the compiler had already optimised. `extern struct` and `packed struct` continue to receive full-severity findings (their layouts are fixed and ABI-stable); regular structs now have findings downgraded one level, matching the existing behaviour for plain Rust structs.
+- **Rust structs/enums with only lifetime generic parameters**: structs like `struct Cache<'a> { ptr: &'a u64, len: usize }` were skipped alongside genuinely-unanalyzable type-generic structs (`struct Foo<T>`). Lifetime parameters (`'a`) do not affect struct layout at all, so the check now distinguishes `GenericParam::Lifetime` from `GenericParam::Type` / `GenericParam::Const`. Structs and enums with only lifetime params are now analyzed normally; those with type or const params continue to be skipped.
+- **Go `sync.WaitGroup` and `time.Time` sizing**: both types went to `uncertain_fields` as unrecognised qualified names. `sync.WaitGroup` (`state atomic.Uint64` + `sema uint32` = 12B, align 8) and `time.Time` (`wall uint64` + `ext int64` + `loc *Location` = 24B, align 8) are now hardcoded in the known-type table alongside the existing `sync.Mutex`/`sync.RWMutex`/`atomic.*` entries. Both are stable under Go's compatibility guarantee.
+- **Rust collection type sizing corrections**: `VecDeque<T>` was sized as 24B (3 words) but is actually 32B (4 words: `head + len + ptr + cap`); `HashMap<K,V>` and `HashSet<V>` were 24B but are 48B on 64-bit (hashbrown `RawTableInner` = 4 words + `RandomState` = 2 words). `BTreeMap`/`BTreeSet` were already correct at 24B.
+- **`RefCell<T>` source sizing**: `RefCell<T>` was sized as pointer_size (8B) regardless of `T`. It is now modelled as `isize` borrow counter (pointer_size at offset 0) + `UnsafeCell<T>` (T at `next_multiple_of(pointer_size, T_align)`), matching measured sizes: `RefCell<()>`=8B, `RefCell<u8>`=16B, `RefCell<u64>`=16B.
+- **Rust unit type `()` field sizing**: `()` as a field type fell through to the pointer-size catch-all and was sized as 8B instead of 0B. Added an explicit `Type::Tuple` branch for empty tuples. This was a latent bug that materialized via `RefCell<()>` and `Option<()>`.
+- **DWARF C++ inheritance (`DW_TAG_inheritance`)**: C++ class inheritance emits a `DW_TAG_inheritance` child DIE in DWARF; previously the extractor only processed `DW_TAG_member` children, so base-class bytes were invisible. A derived class's inherited fields appeared as phantom padding, and the reorder pass produced nonsensical suggestions like "24B → 4B" on a `struct Derived : Base`. Base-class subobjects are now extracted as synthetic `[BaseName]` opaque fields at their correct byte offset. Virtual base classes (`DW_AT_virtuality != 0`) are skipped as their offsets depend on vbtable thunks that cannot be statically modelled.
+- **PDB C++ inheritance (`LF_BCLASS`)**: same gap in the PDB reader — `TypeData::BaseClass` entries in a FieldList were silently ignored alongside static members. Non-virtual base classes are now extracted as synthetic `[BaseName]` opaque fields at their `offset` byte. `TypeData::VirtualBaseClass` (`LF_VBCLASS`/`LF_IVBCLASS`) entries are still skipped for the same vbtable reason.
+
+## [0.10.7] — 2026-07-30
+
+### Fixed
+- **DWARF `DW_TAG_atomic_type` (C11 `_Atomic T`)**: the qualifier wrapper tag was not in padlock's passthrough arm, so it fell to the catch-all which read `DW_AT_byte_size` on the wrapper itself — absent on qualifier tags — and sized the field as 0 bytes. The gap after it then appeared inflated by the real field size. Added to the `const`/`volatile`/`restrict` passthrough arm; the inner type is resolved correctly now.
+- **DWARF `DW_TAG_rvalue_reference_type` (C++ rvalue references)**: rvalue reference fields (`T&&`) fell to the `_` catch-all and were sized as 0 bytes. Added to the pointer arm alongside `DW_TAG_reference_type`; sized as `pointer_size` on all architectures.
+- **C/C++ source `_Atomic(T)` function-form**: tree-sitter represents the `_Atomic(T)` specifier form as an `atomic_type` node (distinct from the `type_qualifier` keyword form). The parser did not handle this node, so the field type was lost and the field was dropped entirely. Added an `atomic_type` handler that extracts the wrapped base type.
+- **C/C++ source `__attribute__((aligned(N)))` on fields**: tree-sitter wraps a field identifier that carries `__attribute__((...))` in an `attributed_declarator` node. The old parser only checked direct children of `field_declaration`, so the field was silently dropped when an attribute was present. Added an `attributed_declarator` handler that extracts both the identifier and the attribute text; added `extract_aligned_from_c_field_text` to parse `aligned(N)` / `__aligned__(N)` from attribute text.
+- **C/C++ source anonymous nested union sizing**: anonymous `union { … }` members inside structs were previously flattened sequentially into the parent (wrong offsets, wrong total size). They are now treated as a single synthetic `__anon_union<size,align>` field sized as `max(variant sizes)` rounded to alignment — correct ABI behaviour.
+- **Go source `sync.Mutex`, `sync.RWMutex`, `sync.Once`, `atomic.*` sizing**: qualified external types that are concrete structs with well-known sizes were treated as unknown opaque types (sized as one pointer) and added to `uncertain_fields`. Added a lookup table for common `sync` and `atomic` package types with their correct sizes; these are no longer added to `uncertain_fields`.
+
+## [0.10.6] — 2026-07-20
+
+### Fixed
+- **Zig frontend `question_mark` lint**: the `else if let Some(un) = union_node { ... } else { return None }` pattern in the type-node dispatcher has been rewritten as idiomatic `let un = union_node?`, satisfying `clippy::question_mark`.
+
+### Security
+- **`fast-uri`** 3.1.0 → 3.1.2: addresses GHSA-v39h-62p7-jpjc and GHSA-q3j6-qgpj-74h6 (VSCode extension transitive dependency).
+- **`qs`** → 6.15.2 and **`tmp`** → 0.2.7: security patches for VSCode extension dependencies.
+- **`markdown-it`**: bumped to patched version in VSCode extension.
+
+### Maintenance
+- **`dependabot.yml` added**: automatic weekly dependency updates for Cargo, npm (VSCode extension), and GitHub Actions, with `rebase-strategy: auto` to keep PR branches rebased on main.
+- **Explicit CodeQL workflow**: `.github/workflows/codeql.yml` added with `security-events: write` permission, replacing GitHub Default Setup which lacked that permission on PR heads from forks.
+- **`padlock-example.yml` updated**: action reference bumped from `gidotencate/padlock@v0.9.3` to `gidotencate/padlock@v0.10.2`.
+
+## [0.10.5] — 2026-04-30
+
+### Fixed
+- **Go embedded pointer field names**: fields declared as `*T` now use `T` as the field name (per Go spec — embedded pointer promotion strips the `*`). Previously the asterisk was included, producing incorrect field names.
+- **`resolve_nested_structs` infinite loop**: iteration is now capped at `len * 2` to prevent an infinite loop when tree-sitter error-recovery produces circular field references (e.g. mutually-recursive pointer types where the `*` is stripped from the error tree).
+- **Child-iteration early-exit in Go, C/C++, Zig frontends**: `node.child(i)?` inside `for` loops silently aborted the enclosing function on any `None` child. Replaced with `else { continue }` so a missing node skips that child and continues parsing.
+
+### Performance
+- **`padlock:ignore` scan**: source is now scanned once for all ignored names (O(source_len)) rather than once per struct (O(N × source_len)). HashSet lookup replaces per-struct linear search.
+- **`should_skip_source_file` filter**: parallelised via rayon — ~15× speedup on cold-cache runs over large source trees.
+- **Parse cache entry cap**: `ParseCache::flush` now drops entries beyond 100k to bound disk and RAM usage on very large projects.
+
+### Dependencies
+- `tree-sitter` → 0.25 (fixes `LanguageError { version: 15 }` crash with ABI-15 grammars)
+- `tree-sitter-c` → 0.24
+- `tree-sitter-go` → 0.25
+
+## [0.10.4] — 2026-04-29
+
+### Performance
+- **Parallel directory walk**: `walk_source_files` now fans out across subdirectories concurrently via rayon, with a final `sort_unstable` for deterministic order.
+- **Thread-local tree-sitter parsers**: Go, Zig, C, and C++ frontends hold one `Parser` per rayon worker thread instead of constructing one per file.
+- **Parallel analysis passes**: `Report::from_layouts` runs per-struct analysis concurrently via `par_iter()`.
+- **Cache rooted at analyzed directory**: `.padlock-cache/layouts.json` is now placed relative to the first analyzed path, not the working directory.
+- **Cache eviction of deleted files**: stale entries are pruned from the cache on flush.
+- **Cache streaming write**: uses `serde_json::to_writer(BufWriter::new(...))` instead of building the full JSON in RAM.
+
+## [0.10.3] — 2026-04-28
+
+### Added
+- **Machine-generated and oversized files are skipped by default**: padlock now detects and silently skips source files that are not worth analyzing — either because they declare themselves as machine-generated (Go `// Code generated`, Rust `// @generated` / `//! @generated`, C/C++ `// Generated by` / `/* Generated by`, protobuf `.pb.h`/`.pb.cc`/`.pb.c`/`.pb.cpp`) or because they exceed 500 KB (data tables such as ECC curve constants, Go SSA rewrite tables, stdlib manifests — files that contain no hand-tunable struct definitions). Use `--include-generated` to opt back in. Resolves multi-minute hangs on codebases such as the Go source tree.
+- **Parallel directory walk**: `walk_source_files` now uses rayon to fan out across subdirectories simultaneously, with a final `sort_unstable` to preserve deterministic file order. Significant speedup on large source trees.
+- **Thread-local tree-sitter parsers**: Go, Zig, C, and C++ frontends now hold one `Parser` instance per rayon worker thread (via `thread_local!`) instead of constructing and initializing a new parser for every file. Eliminates per-file grammar-load overhead at scale.
+- **Parallel analysis passes**: `Report::from_layouts` now runs per-struct analysis concurrently via `par_iter()`. Each struct's padding, reorder, locality, and false-sharing passes are independent and scale with available cores.
+- **Cache rooted at analyzed directory**: the on-disk parse cache (`.padlock-cache/layouts.json`) is now placed relative to the first analyzed path rather than the current working directory. Running `padlock` from different directories on the same codebase shares one cache instead of creating duplicates.
+- **Cache eviction of deleted files**: `ParseCache::flush` now prunes entries whose source file no longer exists before writing. Prevents unbounded cache growth when files are deleted or moved.
+- **Cache uses streaming JSON writer**: `serde_json::to_writer(BufWriter::new(...))` replaces `to_string()` + `fs::write`. Avoids building the full JSON in RAM for large caches.
+
+### Fixed
+- **Go and Zig frontends still printed per-struct `eprintln!` skip notes**: the two-tier skipped-type output introduced in v0.10.1 removed these from the Rust and C/C++ frontends but missed Go and Zig. Both frontends already called `crate::record_skipped` immediately after; the stale `eprintln!` above it was simply redundant and has been removed.
+
+## [0.10.2] — 2026-04-28
+
+### Fixed
+- **O(n²) merge stall on large codebases**: after parallel parsing, hit/miss results were reassembled into walk order using `Vec::find()` — O(n) per file, O(n²) overall. On a 64 K-file codebase (e.g. the Linux kernel source tree) this produced ~4 billion comparisons in the merge step alone, stalling `padlock` after parsing finished. Both lookups are now O(1) via `HashMap`.
+
+## [0.10.1] — 2026-04-28
+
+### Added
+- **Source coverage ratio in output headers**: when any types are skipped (generics/templates), `analyze` output now appends `[N of M types, X% source coverage]` to the header line, with a "consider binary analysis" hint when coverage drops below 70%. `padlock summary` appends `· X% coverage` to the score header.
+- **Live progress indicator during large scans**: directory scans with ≥ 20 cache-miss files show a live stderr counter `padlock: scanning N / M files…` (overwritten with `\r`). Only activates when stderr is a terminal; automatically suppressed for `--json`, `--sarif`, and piped output. Counter starts at cache-hit count so N/M reflects total files, not just misses.
+- **`--show-skipped` flag** (`padlock analyze`): expands the skipped-types section from a count + breakdown to the full per-entry list. By default, at most 10 entries are shown with an "… and N more" trailer.
+- **Skipped types now shown in `padlock summary` and `padlock check`**: `summary` appends a count+breakdown note; `check` was previously discarding skipped data and now attaches it to the report.
+
+### Changed
+- **Skipped-type output is now two-tier**: per-struct `eprintln!` calls during parallel parsing are removed (they fired unordered from rayon threads and duplicated `record_skipped` data). Default output shows one summary line with count and category breakdown (`1 200 C++ template, 47 Rust generic`). Use `--show-skipped` for the full list or `--json` for the complete `skipped` array.
+
 ## [0.10.0] — 2026-04-21
 
 ### Added

@@ -12,7 +12,11 @@
 // aborting the whole run, so a single unparseable file doesn't block analysis
 // of the rest of the project.
 
+use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use padlock_core::findings::SkippedStruct;
 use padlock_core::ir::StructLayout;
@@ -24,17 +28,45 @@ use rayon::prelude::*;
 /// Directories are expanded recursively and parsed in parallel.  Source files
 /// are served from an on-disk mtime cache when possible, skipping unchanged
 /// files.  Errors from individual files are printed as warnings and skipped.
+///
+/// When `include_generated` is `false` (the default), files detected as
+/// machine-generated are silently excluded from analysis.  Pass `true` to
+/// include them (e.g. when analysing a code generator's own output).
 pub fn collect_layouts(
     paths: &[PathBuf],
+    include_generated: bool,
 ) -> anyhow::Result<(Vec<StructLayout>, Vec<String>, Vec<SkippedStruct>)> {
     let mut all_layouts: Vec<StructLayout> = Vec::new();
     let mut analyzed: Vec<String> = Vec::new();
     let mut all_skipped: Vec<SkippedStruct> = Vec::new();
-    let mut cache = crate::cache::ParseCache::load();
+
+    // Anchor the cache to the first analyzed path so that running
+    // `padlock summary ~/projects/foo/src/` from any CWD always hits
+    // the same cache file (~/projects/foo/src/.padlock-cache/layouts.json).
+    let cache_root = paths
+        .first()
+        .map(|p| {
+            if p.is_dir() {
+                p.clone()
+            } else {
+                p.parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("."))
+            }
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut cache = crate::cache::ParseCache::load(&cache_root);
 
     for path in paths {
         if path.is_dir() {
-            let files = walk_source_files(path);
+            let mut files = walk_source_files(path);
+            if !include_generated {
+                files = files
+                    .into_par_iter()
+                    .filter(|f| !should_skip_source_file(f))
+                    .collect();
+                files.sort_unstable();
+            }
             if files.is_empty() {
                 eprintln!(
                     "padlock: warning: no source files found in {}",
@@ -59,14 +91,51 @@ pub fn collect_layouts(
                 }
             }
 
-            // Parse cache-miss files in parallel.
+            // Parse cache-miss files in parallel, with a progress indicator on
+            // stderr when there are enough misses to be worth showing (≥20) and
+            // stderr is a terminal.  The counter starts at the number of cache
+            // hits so the displayed N/M reflects all files, not just misses.
+            let total_files = files.len();
+            let n_hits = hits.len();
+            let parsed_count = Arc::new(AtomicUsize::new(n_hits));
+            let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            let progress_thread = if misses.len() >= 20 && std::io::stderr().is_terminal() {
+                let counter = parsed_count.clone();
+                let stop = stop_flag.clone();
+                Some(std::thread::spawn(move || {
+                    use std::io::Write;
+                    loop {
+                        let n = counter.load(Ordering::Relaxed);
+                        eprint!("\r  padlock: scanning {n} / {total_files} files…");
+                        let _ = std::io::stderr().flush();
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                    // Clear the progress line.
+                    eprint!("\r{:<60}\r", "");
+                    let _ = std::io::stderr().flush();
+                }))
+            } else {
+                None
+            };
+
+            let counter_ref = parsed_count.clone();
             let miss_results: Vec<_> = misses
                 .par_iter()
                 .map(|file| {
                     let r = padlock_source::parse_source(file, arch);
+                    counter_ref.fetch_add(1, Ordering::Relaxed);
                     (file.clone(), r)
                 })
                 .collect();
+
+            stop_flag.store(true, Ordering::Relaxed);
+            if let Some(handle) = progress_thread {
+                let _ = handle.join();
+            }
 
             // Store new results in cache (layouts + skipped).
             for (file, result) in &miss_results {
@@ -75,24 +144,33 @@ pub fn collect_layouts(
                 }
             }
 
+            // Build O(1) lookup maps before merging — avoids O(n²) linear scans
+            // over hits/miss_results for each file in the 64 K-entry walk order.
+            let hit_map: HashMap<&PathBuf, (&Vec<StructLayout>, &Vec<SkippedStruct>)> =
+                hits.iter().map(|(p, l, s)| (p, (l, s))).collect();
+            let mut miss_map: HashMap<PathBuf, _> = miss_results.into_iter().collect();
+
             // Merge hits and misses back in original file order.
             for file in &files {
-                if let Some((_, layouts, skipped)) = hits.iter().find(|(f, _, _)| f == file) {
+                if let Some((layouts, skipped)) = hit_map.get(file) {
                     analyzed.push(file.display().to_string());
-                    all_layouts.extend(layouts.clone());
-                    all_skipped.extend(skipped.clone());
-                } else if let Some((_, result)) = miss_results.iter().find(|(f, _)| f == file) {
+                    all_layouts.extend((*layouts).clone());
+                    all_skipped.extend((*skipped).clone());
+                } else if let Some(result) = miss_map.remove(file) {
                     match result {
                         Ok(output) => {
                             analyzed.push(file.display().to_string());
-                            all_layouts.extend(output.layouts.clone());
-                            all_skipped.extend(output.skipped.clone());
+                            all_layouts.extend(output.layouts);
+                            all_skipped.extend(output.skipped);
                         }
                         Err(e) => eprintln!("padlock: warning: {}: {e}", file.display()),
                     }
                 }
             }
         } else if padlock_source::detect_language(path).is_some() {
+            if !include_generated && should_skip_source_file(path) {
+                continue;
+            }
             let arch = padlock_dwarf::reader::detect_arch_from_host();
             // Try cache for single source files too.
             let (layouts, skipped) = if let Some((layouts, skipped)) = cache.get(path) {
@@ -158,33 +236,42 @@ pub fn collect_layouts(
 ///   - Hidden directories (names starting with `.`)
 ///   - `target/`, `node_modules/`, `_build/`, `dist/`, `build/`, `vendor/`
 ///
-/// Results are returned in a stable (sorted) order.
+/// Directories at each level are explored in parallel (rayon).  Results are
+/// returned in a stable global sort order so downstream cache lookups and
+/// output ordering are deterministic.
 pub fn walk_source_files(dir: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    walk_inner(dir, &mut files);
+    let mut files = collect_files_parallel(dir);
+    // Global sort restores deterministic order after parallel collection.
+    files.sort_unstable();
     files
 }
 
-fn walk_inner(dir: &Path, out: &mut Vec<PathBuf>) {
+fn collect_files_parallel(dir: &Path) -> Vec<PathBuf> {
     let Ok(read) = std::fs::read_dir(dir) else {
-        return;
+        return Vec::new();
     };
-    let mut entries: Vec<_> = read.filter_map(|e| e.ok()).collect();
-    // Stable order: sort by file name so output is deterministic.
-    entries.sort_by_key(|e| e.file_name());
-
-    for entry in entries {
-        let path = entry.path();
-        if path.is_dir() {
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            if should_skip_dir(&name) {
-                continue;
+    let entries: Vec<_> = read.filter_map(|e| e.ok()).collect();
+    entries
+        .into_par_iter()
+        .flat_map(|entry| -> Vec<PathBuf> {
+            // Use DirEntry::file_type() — avoids an extra stat() call vs path.is_dir().
+            let Ok(ft) = entry.file_type() else {
+                return Vec::new();
+            };
+            let path = entry.path();
+            if ft.is_dir() {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if should_skip_dir(&name) {
+                    return Vec::new();
+                }
+                collect_files_parallel(&path)
+            } else if padlock_source::detect_language(&path).is_some() {
+                vec![path]
+            } else {
+                Vec::new()
             }
-            walk_inner(&path, out);
-        } else if padlock_source::detect_language(&path).is_some() {
-            out.push(path);
-        }
-    }
+        })
+        .collect()
 }
 
 /// Returns `true` when `data` is a raw BTF blob (not an ELF container).
@@ -223,6 +310,46 @@ fn extract_btf_layouts(
         .ok_or_else(|| anyhow::anyhow!("no .BTF section"))?;
     let btf_data = section.data()?;
     padlock_dwarf::btf::extract_from_btf(btf_data, arch)
+}
+
+/// Returns `true` when a source file should be skipped without parsing.
+///
+/// Checked in cheapest-first order:
+///
+/// - **Known-generated extensions**: `.pb.h`, `.pb.cc`, `.pb.c`, `.pb.cpp` — no I/O.
+/// - **Over-size**: files larger than 500 KB. Source files with struct definitions
+///   are never this large; files this size are generated rule tables or raw data.
+/// - **Standard generation markers** in the first 512 bytes: Go `// Code generated`,
+///   Rust `// @generated` / `//! @generated`, C/C++ `// Generated by` / `/* Generated by`.
+pub fn should_skip_source_file(path: &Path) -> bool {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    if name.ends_with(".pb.h")
+        || name.ends_with(".pb.cc")
+        || name.ends_with(".pb.c")
+        || name.ends_with(".pb.cpp")
+    {
+        return true;
+    }
+    if std::fs::metadata(path)
+        .map(|m| m.len() > 500_000)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    use std::io::Read;
+    let mut buf = [0u8; 512];
+    let n = f.read(&mut buf).unwrap_or(0);
+    let Ok(head) = std::str::from_utf8(&buf[..n]) else {
+        return false;
+    };
+    head.contains("// Code generated")
+        || head.contains("// @generated")
+        || head.contains("//! @generated")
+        || head.contains("// Generated by")
+        || head.contains("/* Generated by")
 }
 
 fn should_skip_dir(name: &str) -> bool {
@@ -315,7 +442,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("s.rs");
         fs::write(&file, "struct S { x: i32, y: i32 }").unwrap();
-        let (layouts, analyzed, _skipped) = collect_layouts(&[file]).unwrap();
+        let (layouts, analyzed, _skipped) = collect_layouts(&[file], false).unwrap();
         assert!(!layouts.is_empty());
         assert_eq!(analyzed.len(), 1);
         assert!(layouts.iter().any(|l| l.name == "S"));
@@ -326,7 +453,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("a.rs"), "struct A { x: i32 }").unwrap();
         fs::write(dir.path().join("b.rs"), "struct B { y: i64 }").unwrap();
-        let (layouts, analyzed, _skipped) = collect_layouts(&[dir.path().to_path_buf()]).unwrap();
+        let (layouts, analyzed, _skipped) =
+            collect_layouts(&[dir.path().to_path_buf()], false).unwrap();
         assert!(layouts.iter().any(|l| l.name == "A"));
         assert!(layouts.iter().any(|l| l.name == "B"));
         assert_eq!(analyzed.len(), 2);
@@ -339,7 +467,7 @@ mod tests {
         let b = dir.path().join("b.rs");
         fs::write(&a, "struct A { x: i32 }").unwrap();
         fs::write(&b, "struct B { y: i64 }").unwrap();
-        let (layouts, _, _skipped) = collect_layouts(&[a, b]).unwrap();
+        let (layouts, _, _skipped) = collect_layouts(&[a, b], false).unwrap();
         assert!(layouts.iter().any(|l| l.name == "A"));
         assert!(layouts.iter().any(|l| l.name == "B"));
     }
@@ -404,5 +532,134 @@ mod tests {
             is_raw_btf(&[0x9F, 0xEB, 0x00, 0x00]),
             "4-byte BTF magic must be detected"
         );
+    }
+
+    // ── should_skip_source_file ─────────────────────────────────────────────────────
+
+    fn write_tmp(dir: &TempDir, name: &str, content: &str) -> PathBuf {
+        let p = dir.path().join(name);
+        fs::write(&p, content).unwrap();
+        p
+    }
+
+    #[test]
+    fn generated_go_code_generated_marker() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(
+            &dir,
+            "gen.go",
+            "// Code generated by protoc-gen-go. DO NOT EDIT.\npackage foo\n",
+        );
+        assert!(should_skip_source_file(&p));
+    }
+
+    #[test]
+    fn generated_rust_at_generated_marker() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(
+            &dir,
+            "gen.rs",
+            "// @generated\n// This file was generated.\npub struct Foo {}\n",
+        );
+        assert!(should_skip_source_file(&p));
+    }
+
+    #[test]
+    fn generated_rust_bang_at_generated_marker() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "gen.rs", "//! @generated\npub struct Foo {}\n");
+        assert!(should_skip_source_file(&p));
+    }
+
+    #[test]
+    fn generated_c_generated_by_line_comment() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(
+            &dir,
+            "gen.h",
+            "// Generated by flatc. DO NOT EDIT.\n#pragma once\n",
+        );
+        assert!(should_skip_source_file(&p));
+    }
+
+    #[test]
+    fn generated_c_generated_by_block_comment() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "gen.h", "/* Generated by protoc. */\n#pragma once\n");
+        assert!(should_skip_source_file(&p));
+    }
+
+    #[test]
+    fn generated_pb_h_extension() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "foo.pb.h", "#pragma once\nstruct Foo {};\n");
+        assert!(should_skip_source_file(&p));
+    }
+
+    #[test]
+    fn generated_pb_cc_extension() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "foo.pb.cc", "#include \"foo.pb.h\"\n");
+        assert!(should_skip_source_file(&p));
+    }
+
+    #[test]
+    fn generated_pb_c_extension() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "foo.pb.c", "/* protobuf output */\n");
+        assert!(should_skip_source_file(&p));
+    }
+
+    #[test]
+    fn generated_pb_cpp_extension() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "foo.pb.cpp", "/* protobuf output */\n");
+        assert!(should_skip_source_file(&p));
+    }
+
+    #[test]
+    fn not_generated_normal_go_file() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "main.go", "package main\ntype Foo struct { X int }\n");
+        assert!(!should_skip_source_file(&p));
+    }
+
+    #[test]
+    fn not_generated_normal_rust_file() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(
+            &dir,
+            "lib.rs",
+            "// My hand-written library.\npub struct Bar {}\n",
+        );
+        assert!(!should_skip_source_file(&p));
+    }
+
+    #[test]
+    fn not_generated_normal_c_file() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "foo.h", "#pragma once\nstruct MyStruct { int x; };\n");
+        assert!(!should_skip_source_file(&p));
+    }
+
+    #[test]
+    fn oversized_file_is_skipped() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("big.go");
+        // Write a file just over the 500 KB threshold.
+        let content = "package foo\n".to_string() + &"// x\n".repeat(100_001);
+        fs::write(&p, &content).unwrap();
+        assert!(should_skip_source_file(&p));
+    }
+
+    #[test]
+    fn file_under_size_limit_is_not_skipped_by_size() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("small.go");
+        // Write a file well under the threshold.
+        let content =
+            "package foo\ntype Foo struct { X int }\n".to_string() + &"// x\n".repeat(1_000);
+        fs::write(&p, &content).unwrap();
+        assert!(!should_skip_source_file(&p));
     }
 }
